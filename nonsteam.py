@@ -25,6 +25,7 @@ from collections import Counter
 import traceback
 from os.path import isdir, isfile, join
 import os
+import re
 
 import clr
 import System
@@ -34,6 +35,9 @@ from System.IO import FileInfo, Path
 from System import Array, Object
 from System.Windows import MessageBoxButton, MessageBoxImage, MessageBoxResult
 from Playnite.SDK.Plugins import ScriptGameMenuItem
+from Playnite.SDK import ImageFileOption, GenericItemOption
+from Playnite.SDK.Models import GameAction
+from shutil import copyfile
 
 clr.AddReference("System.Core")
 clr.ImportExtensions(System.Linq)
@@ -195,6 +199,30 @@ def steam_URL(shortcut):
     full_64 = (top_32 << 32) | 0x02000000
     return "steam://rungameid/" + str(full_64)
 
+def legacySteamID(shortcut):
+    # SteamGrid Images uses the Legacy 32 Steam ID. We get it here
+    # Comments by Scott Rice:
+    """
+    Calculates the filename for a given shortcut. This filename is a 64bit
+    integer, where the first 32bits are a CRC32 based off of the name and
+    target (with the added condition that the first bit is always high), and
+    the last 32bits are 0x02000000.
+    """
+    # This will seem really strange (where I got all of these values), but I
+    # got the xor_in and xor_out from disassembling the steamui library for
+    # OSX. The reflect_in, reflect_out, and poly I figured out via trial and
+    # error.
+    algorithm = Crc(
+        width=32,
+        poly=0x04C11DB7,
+        reflect_in=True,
+        xor_in=0xFFFFFFFF,
+        reflect_out=True,
+        xor_out=0xFFFFFFFF,
+    )
+    input_string = shortcut["exe"].encode("utf-8") + shortcut["appname"].encode("utf-8")
+    top_32 = algorithm.bit_by_bit(input_string) | 0x80000000
+    return str(top_32 )
 
 def find_play_action(game):
     """
@@ -238,6 +266,7 @@ def non_steam_shortcuts(menu_args):
         return
 
     shortcuts_vdf = join(steam_userdata, "config", "shortcuts.vdf")
+    shortcuts_images = join(steam_userdata, "config", "grid")
 
     if isfile(shortcuts_vdf):
         try:
@@ -262,6 +291,39 @@ def non_steam_shortcuts(menu_args):
     for game in menu_args.Games:
         play_action = find_play_action(game)
 
+        steam_url = None
+        for link in game.Links:
+            if link.Name.lower() == 'steam':
+                steam_url = link.Url
+
+        # https://store.steampowered.com/app/3232323/game_name_here --> 3232323
+        if steam_url:
+            steam_shortcut_appname_regex  = re.findall(r"\/(\d+)", steam_url)
+            steam_shortcut_appname = steam_shortcut_appname_regex[0] if steam_shortcut_appname_regex else None                
+            if steam_shortcut_appname:
+                result = PlayniteApi.Dialogs.SelectString("We found a steam appid of {} in steam url, keep it or replace in the input box.".format(steam_shortcut_appname),
+                                                          "Game name dialog",
+                                                          steam_shortcut_appname)
+                if not result.Result:
+                    steam_shortcut_appname = game.Name
+                    result = PlayniteApi.Dialogs.SelectString("Using game name, {}, as steam appid, keep it or replace in the input box.".format(steam_shortcut_appname),
+                                                              "Game name dialog",
+                                                              steam_shortcut_appname)
+            else:
+                steam_shortcut_appname = game.Name
+                result = PlayniteApi.Dialogs.SelectString("Did not find steam appid in steam url, using game name, {}, as shortcut name, keep it or replace in the input box.".format(steam_shortcut_appname),
+                                                          "Game name dialog",
+                                                          steam_shortcut_appname)
+        else:
+            steam_shortcut_appname = game.Name
+            result = PlayniteApi.Dialogs.SelectString("Did not find steam url, using game name, {}, as shortcut name, keep it or replace in the input box.".format(steam_shortcut_appname),
+                                                      "Game name dialog",
+                                                      steam_shortcut_appname)
+        if not result.Result:
+            PlayniteApi.Dialogs.ShowMessage("Got cancel response. Cancelling script for this game.")
+            continue
+        steam_shortcut_appname = result.SelectedString
+
         # If a game somehow has no PlayAction, skip it
         if not play_action:
             games_skipped_no_action.append(game.Name)
@@ -276,8 +338,81 @@ def non_steam_shortcuts(menu_args):
             games_skipped_steam_native.append(game.Name)
             continue
 
-        # If a game has a URL PlayAction, use it anyway but log it
-        if play_action.Type == GameActionType.URL:
+        # Only edit actions once with script.
+        if play_action == game.PlayAction:
+            play_action_already_created_by_script = False
+        else:
+            play_action_already_created_by_script = True
+        # If a game has a URL PlayAction and it hasn't already been ran through this script, ask to change to exe, if not, use url anyway, but log it
+        if play_action.Type == GameActionType.URL and not play_action_already_created_by_script:
+            message = "Game, {}, has a URL as it's PlayAction, do you want to change that to an executable? Steam cannot open the overlay when games are started by URL.".format(game.Name)
+            change_url = PlayniteApi.Dialogs.ShowMessage(message,
+                                                         "Is this the game's executable?",
+                                                         MessageBoxButton.YesNo)
+            if change_url == MessageBoxResult.Yes:
+                # Getting exe from listdir and getting the largest file with .exe (should work most of the time I think)
+                game_dir = game.InstallDirectory
+                largest_exe = None
+                largest_exe_size = 0
+                for exe in os.listdir(game_dir):
+                    if exe.endswith(".exe"):
+                        full_exe = join(game_dir, exe)
+                        size = os.path.getsize(full_exe)
+                        if size > largest_exe_size:
+                            largest_exe = full_exe
+                            largest_exe_size = size
+                if largest_exe:
+                    message = "This is the largest executable (.exe) in this game's directory, would you like to continue with it?\n\n{}".format(largest_exe)
+                    good_exe = PlayniteApi.Dialogs.ShowMessage(message,
+                                                               "Do you want to use this .exe?",
+                                                               MessageBoxButton.YesNo)
+                    if good_exe == MessageBoxResult.Yes:
+                        # Move old PlayAction to OtherActions and create new url PlayAction
+                        old_action = game.PlayAction
+                        new_url_action = GameAction(Name="URL Action Created With Non-Steam Script",
+                                                    Type=GameActionType.File,
+                                                    Path=largest_exe,
+                                                    IsHandledByPlugin=False)
+                        game.PlayAction = new_url_action
+                        if not game.OtherActions:
+                            game.OtherActions = ObservableCollection[GameAction]()
+                        # Move URL PlayAction created by script to Other Actions iff the action is new.
+                        if not old_action == new_url_action:
+                            old_action.Name = "Original Action Before Changing To Executable PlayAction"
+                            game.OtherActions.Add(old_action)
+                    else:
+                        PlayniteApi.Dialogs.ShowMessage("No file selected, will continue with PlayAction as a URL.")
+                else:
+                    message = "Didn't find any executables (.exe) in this game's directory. Open a file selection window? (We'll continue otherwise)"
+                    open_file_selection = PlayniteApi.Dialogs.ShowMessage(message,
+                                                                          "No executable found",
+                                                                           MessageBoxButton.YesNo)
+                    if open_file_selection == MessageBoxResult.Yes:
+                        file_selected = PlayniteApi.Dialogs.SelectFile("")
+                        if file_selected:
+                            # Move old PlayAction to OtherActions and create new url PlayAction
+                            old_action = game.PlayAction
+                            new_url_action = GameAction(Name="URL Action Created With Non-Steam Script",
+                                                        Type=GameActionType.File,
+                                                        Path=file_selected,
+                                                        IsHandledByPlugin=False)
+                            game.PlayAction = new_url_action
+                            if not game.OtherActions:
+                                game.OtherActions = ObservableCollection[GameAction]()
+                            # Move URL PlayAction created by script to Other Actions iff the action is new.
+                            if not old_action == new_url_action:
+                                old_action.Name = "Original Action Before Changing To Executable PlayAction"
+                                game.OtherActions.Add(old_action)
+                        else:
+                            PlayniteApi.Dialogs.ShowMessage("No file selected, will continue with PlayAction as a URL.")
+                    else:
+                        PlayniteApi.Dialogs.ShowMessage("No file selected, will continue with PlayAction as a URL.")
+                        
+
+        play_action = game.PlayAction
+        # Check after changes if PlayAction is still a URL
+        play_action_expanded = PlayniteApi.ExpandGameVariables(game, play_action)
+        if play_action.Type == GameActionType.URL and not "steam" in play_action_expanded.Path:
             __logger.Warn(
                 "Non-Steam: Game has a URL as PlayAction: {}".format(game.Name)
             )
@@ -320,25 +455,26 @@ def non_steam_shortcuts(menu_args):
             icon = PlayniteApi.Database.GetFullFilePath(game.Icon)
         else:
             icon = ""
+        # this is the shortcut that will be past to steam, appname must equal game SteamID for steam controller to use configs.
         shortcut = {
             "icon": icon,
             "exe": '"{}"'.format(exe),
             "startdir": '"{}"'.format(start_dir),
-            "appname": game.Name,
+            "appname": steam_shortcut_appname,
             "launchoptions": arguments,
         }
-        if game.Name in steam_shortcuts:
+        if steam_shortcut_appname in steam_shortcuts:
             games_updated += 1
-            steam_shortcuts[game.Name].update(shortcut)
-            shortcut = steam_shortcuts[game.Name]
+            steam_shortcuts[steam_shortcut_appname].update(shortcut)
+            shortcut = steam_shortcuts[steam_shortcut_appname]
         else:
             games_new += 1
             shortcut.update(SHORTCUT_DEFAULTS)
-            steam_shortcuts[game.Name] = shortcut
+            steam_shortcuts[steam_shortcut_appname] = shortcut
 
         # Update Playnite actions
         # Only run once, don't create duplicate OtherActions
-        if play_action == game.PlayAction:
+        if not play_action_already_created_by_script:
             old_action = game.PlayAction
             steam_action = GameAction(
                 Name="Non-Steam Steam Shortcut",
@@ -350,11 +486,44 @@ def non_steam_shortcuts(menu_args):
             if not game.OtherActions:
                 game.OtherActions = ObservableCollection[GameAction]()
             old_action.Name = "Launch without Steam"
-            game.OtherActions.Insert(0, old_action)
+            game.OtherActions.Add(old_action)
         else:
             # play_action is already an OtherAction
             # Just make sure the URL is up to date on the main PlayAction
             game.PlayAction.Path = steam_URL(shortcut)
+
+        # Copy Playnite Cover to Steam grids folder as portrait photo w/dialog box for selection
+        if game.CoverImage:
+          image_list = System.Collections.Generic.List[ImageFileOption]()
+          image_list.Add(ImageFileOption(PlayniteApi.Database.GetFullFilePath(game.CoverImage)))
+          image = PlayniteApi.Dialogs.ChooseImageFile(image_list, "Choose Steam Grid Background photo. Select cancel for none.", 300, 400)
+          # If an image is selected, we use it, otherwise we just ignore the copyfile.
+          if image:
+            #PlayniteApi.Dialogs.ShowMessage(image.Path) # debug
+            copyfile(str(image.Path), shortcuts_images +"\\" + legacySteamID(shortcut) + "p.png")
+          else:
+            PlayniteApi.Dialogs.ShowMessage("No image selected, will not use cover image then.")
+        else:
+          PlayniteApi.Dialogs.ShowMessage("This game does not have a cover image, won't be setting one.")
+
+
+        # Copy Playnite Background to Steam grids folder as hero and default photo w/dialog box for selection
+        if game.BackgroundImage:
+          image_list = System.Collections.Generic.List[ImageFileOption]()
+          image_list.Add(ImageFileOption(PlayniteApi.Database.GetFullFilePath(game.BackgroundImage)))
+          image = PlayniteApi.Dialogs.ChooseImageFile(image_list, "Choose Steam Grid Cover photo. Select cancel for none.", 300, 400)
+          # If an image is selected, we use it, otherwise we just ignore the copyfile.
+          if image:
+            #PlayniteApi.Dialogs.ShowMessage(image.Path) # debug
+            copyfile(str(image.Path), shortcuts_images +"\\" + legacySteamID(shortcut) + "_hero.png")
+            copyfile(str(image.Path), shortcuts_images +"\\" + legacySteamID(shortcut) + ".png")
+          else:
+            PlayniteApi.Dialogs.ShowMessage("No image selected, will not use cover image then.")
+        else:
+          PlayniteApi.Dialogs.ShowMessage("This game does not have a background image, won't be setting one.")
+
+        #PlayniteApi.Dialogs.ShowMessage(broken-for-debugging-without-completing-script)
+
 
     # Save updated shortcuts.vdf
     try:
@@ -398,7 +567,7 @@ def non_steam_shortcuts(menu_args):
         )
         message += "\n".join(games_skipped_steam_native)
         errors = True
-    if games_skipped_no_action:
+    if games_skipped_no_action:                                                               
         message += "\n\nSkipped {} game(s) without any PlayAction set (not installed?):\n".format(
             len(games_skipped_no_action)
         )
